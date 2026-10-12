@@ -22,10 +22,30 @@
 - 位置同步：四种模式共享当前照片，分别保留缩放状态。筛选排除当前照片时选择拍摄时间最近的结果；悬停不会改变保存位置。
 - 实况照片：长按超过 350 毫秒静音播放，松开、拖动、切换模式或离开窗口即停止；普通点击打开大图。下载失败时保留封面，可重新长按重试。
 
+## 下载安装
+
+不想自己编译的话，直接下载打包好的版本：
+
+**https://github.com/Justinchengpepe/star-trail/releases/latest**
+
+- 通用二进制，同时支持 Apple Silicon（M 系列）和 Intel 的 Mac
+- 要求 macOS 15 或更高版本
+
+解压后把 `星迹.app` 拖进「应用程序」文件夹即可。
+
+> **首次打开会被 macOS 拦下**，提示「无法打开，因为 Apple 无法检查其是否包含恶意软件」。
+> 这是因为应用只做了 ad-hoc 签名、没有 Apple 开发者证书，并不是应用本身有问题。
+> 解决方法：**右键点击 `星迹.app` → 选「打开」→ 在弹窗里再点一次「打开」**，之后就正常了。
+> 也可以一次性解除限制：
+>
+> ```sh
+> xattr -cr /Applications/星迹.app
+> ```
+
 ## 使用
 
 1. 确保 macOS「照片」App 已开启 iCloud 照片同步。
-2. 双击 `dist/星迹.app`。
+2. 打开 `星迹.app`（下载版在「应用程序」里，自己编译的在 `dist/`）。
 3. 首次运行时点击「允许访问照片」，在系统弹窗中授权。
 
 应用不会上传照片。iCloud 中尚未下载的缩略图或原图，会由 macOS 照片服务按需下载。
@@ -38,7 +58,7 @@
 
 事件索引和事件名称存储在 `~/Library/Application Support/NebulaPhotos/photo-index.sqlite`。事件分组只读取拍摄日期和定位，在后台生成，不再运行相似度比较、向量生成或语义模型推理。旧版生成的模型和分析缓存不再加载；原始照片与手动主题修正保持不变。
 
-## 重新构建
+## 从源码构建
 
 在项目目录运行：
 
@@ -47,6 +67,6 @@ chmod +x build.sh
 ./build.sh
 ```
 
-只需要 macOS 自带的 Swift 命令行工具，不依赖第三方库。
+只需要 macOS 自带的 Swift 命令行工具，不依赖第三方库。脚本会分别编译 arm64 与 x86_64，再用 `lipo` 合成通用二进制，产物在 `dist/星迹.app`。
 
 交互研究参考：[Carousel.SwiftUI](https://github.com/JuniperPhoton/Carousel.SwiftUI) 的连续位置控制和 [CoverFlow 示例](https://gist.github.com/Codelaby/3d80c1e475bf036399d97ee8eb5861be) 的空间卡片效果；实现保留原生 SwiftUI，不引入额外依赖。
