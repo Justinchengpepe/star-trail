@@ -1,5 +1,15 @@
 # review.md 处理记录
 
+## 1.1.1 权限回归修复
+
+发布 1.1 后，真实使用发现系统设置允许照片访问但应用仍报告未授权。核验正在运行的下载包后，确认其启用了 Hardened Runtime，却没有任何资源访问 entitlement。补上 `com.apple.security.personal-information.photos-library` 并在构建结束检查 arm64 和 x86_64 的实际签名，避免仅检查源码或签名完整性而遗漏功能权限。此前“构建通过”不能视为实际图库访问验证通过。
+
+本修复不关闭 Hardened Runtime，不启用其他资源权限，不加入照片修改/删除调用；不将 Photos Library entitlement 冒充沙箱或系统授权。依据：[Apple Photos Library Entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.personal-information.photos-library)。
+
+实际验证：修复版进程来自本地 1.1.1 构建路径；用户确认图库出现，随后从实时应用状态确认照片加载成功。压缩包解压后校验两种架构的 entitlement 和签名完整性通过。
+
+1.1.1 安装包 SHA-256：`0ebd26d0d8ef8be3d3cf1cbd4ed0aba3c3aa600294fcf20a58f8b0149b4d292b`；主程序 SHA-256：`702d6aaf199ad12aa2351317346aa33c462dba6339363b486b3ebfd7dc91d01f`。这些指纹与下方早期版本不同。
+
 日期：2026-10-13（北京时间）。依据用户提供的 v1.0 静态审查，核对当前工作区后修改。未改动原审查文件，也未发布或更新 GitHub 下载包。
 
 v1.1 发布准备：应用版本 1.1，构建号 2。以下历史校验值对应隐私修复时的本地构建；发布包以本节指纹为准：

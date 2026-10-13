@@ -38,10 +38,20 @@ xattr -dr com.apple.FinderInfo "$APP_DIR" 2>/dev/null || true
 xattr -dr com.apple.ResourceFork "$APP_DIR" 2>/dev/null || true
 STARTRAIL_BUILD_IDENTITY="${STARTRAIL_SIGNING_IDENTITY:--}"
 if [[ "$STARTRAIL_BUILD_IDENTITY" == "-" ]]; then
-  codesign --force --options runtime --sign - "$APP_DIR"
+  codesign --force --options runtime --entitlements "$PROJECT_DIR/Resources/PhotoAccess.entitlements" --sign - "$APP_DIR"
 else
-  codesign --force --options runtime --timestamp --sign "$STARTRAIL_BUILD_IDENTITY" "$APP_DIR"
+  codesign --force --options runtime --entitlements "$PROJECT_DIR/Resources/PhotoAccess.entitlements" --timestamp --sign "$STARTRAIL_BUILD_IDENTITY" "$APP_DIR"
 fi
 codesign --verify --deep --strict "$APP_DIR"
+
+# Verify the actual signed executable, not just the source entitlement file.
+# A valid signature alone does not ensure Photos access under Hardened Runtime.
+for ARCH in arm64 x86_64; do
+  STARTRAIL_ENTITLEMENTS_JSON="$(codesign -d --xml --arch "$ARCH" --entitlements - "$APP_DIR" 2>/dev/null | plutil -convert json -o - -)"
+  if [[ "$STARTRAIL_ENTITLEMENTS_JSON" != *'"com.apple.security.personal-information.photos-library":true'* ]]; then
+    echo "Missing Photos Library entitlement in $ARCH signature" >&2
+    exit 1
+  fi
+done
 
 echo "$APP_DIR"
