@@ -9,9 +9,26 @@ final class BrowsingState {
     var orbitZoom: CGFloat = 1
     var gridWidth: CGFloat = 142
     var activeStackID: String?
+    // The return transition triggers restoration. Remembering an overview anchor
+    // must not invalidate every photo while a horizontal gesture is in progress.
+    @ObservationIgnored private var stackOverviewIDs: [String: String] = [:]
     private var focusedDate: Date?
 
     init() { PhotoInteractionActivity.install() }
+
+    func stackOverviewID(for source: String) -> String? { stackOverviewIDs[source] }
+
+    func rememberStackOverview(_ id: String?, source: String) {
+        // A disappearing scroll view can report nil; keep the return anchor.
+        guard let id else { return }
+        stackOverviewIDs[source] = id
+    }
+
+    func reconcileStackOverview(source: String, availableIDs: [String]) {
+        if let id = stackOverviewIDs[source], !availableIDs.contains(id) {
+            stackOverviewIDs.removeValue(forKey: source)
+        }
+    }
 
     func focus(_ photo: MemoryPhoto) {
         guard focusedID != photo.id else { return }

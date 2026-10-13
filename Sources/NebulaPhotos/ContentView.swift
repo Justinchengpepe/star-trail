@@ -9,6 +9,22 @@ enum GalleryMode: String, CaseIterable, Identifiable {
     case gallery = "画廊"
 
     var id: String { rawValue }
+    var shortcut: KeyEquivalent {
+        switch self {
+        case .nebula: return "1"
+        case .stack: return "2"
+        case .orbit: return "3"
+        case .gallery: return "4"
+        }
+    }
+    var shortcutHint: String {
+        switch self {
+        case .nebula: return "⌘1"
+        case .stack: return "⌘2"
+        case .orbit: return "⌘3"
+        case .gallery: return "⌘4"
+        }
+    }
     var icon: String {
         switch self {
         case .nebula: return "sparkles"
@@ -211,6 +227,7 @@ struct ContentView: View {
         }
         .preferredColorScheme(lightBackground ? .light : .dark)
         .environment(\.depthOfFieldEnabled, depthOfField)
+        .focusedSceneValue(\.photoBrowserMode, selectedPhoto == nil ? $mode : nil)
     }
 
     @ViewBuilder
@@ -242,6 +259,7 @@ struct HeaderBar: View {
     @Binding var query: String
     @Binding var lightBackground: Bool
     @Binding var depthOfField: Bool
+    @FocusState private var searchFocused: Bool
 
     var body: some View {
         HStack(spacing: 16) {
@@ -251,10 +269,20 @@ struct HeaderBar: View {
             Spacer()
 
             HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
+                Button { searchFocused = true } label: {
+                    Image(systemName: "magnifyingglass")
+                }
+                    .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
+                    .help("搜索照片（⌘F）")
+                    .accessibilityLabel("搜索照片")
                 TextField("搜索日期、主题、文字", text: $query)
                     .textFieldStyle(.plain)
+                    .focused($searchFocused)
+                    .onExitCommand {
+                        if query.isEmpty { searchFocused = false }
+                        else { query = "" }
+                    }
                     .frame(width: 150)
                 if !query.isEmpty {
                     Button { query = "" } label: {
@@ -270,36 +298,37 @@ struct HeaderBar: View {
             .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.09)))
 
-            Button {
-                library.canReadLibrary ? library.refresh() : library.requestAccess()
-            } label: {
-                Image(systemName: library.canReadLibrary ? "arrow.clockwise" : "photo.on.rectangle.angled")
-                    .frame(width: 38, height: 38)
-            }
-            .buttonStyle(GlassButtonStyle())
-            .help(library.canReadLibrary ? "刷新照片" : "连接 iCloud 照片")
-            .accessibilityLabel(library.canReadLibrary ? "刷新照片" : "连接 iCloud 照片")
-
             if library.canReadLibrary {
-                Button {
-                    library.isAnalyzing ? library.cancelAnalysis() : library.analyzeThemes()
-                } label: {
-                    ZStack {
-                        Image(systemName: library.isAnalyzing ? "stop.fill" : "wand.and.stars")
-                            .frame(width: 38, height: 38)
-                        if library.isAnalyzing {
-                            Circle()
-                                .trim(from: 0, to: library.analysisProgress)
-                                .stroke(Color.cyan, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                                .rotationEffect(.degrees(-90))
-                                .frame(width: 34, height: 34)
-                        }
+                Menu {
+                    Button { library.refresh() } label: { Label("刷新照片", systemImage: "arrow.clockwise") }
+                        .disabled(library.isLoading)
+                    Button { library.isAnalyzing ? library.cancelAnalysis() : library.analyzeThemes() } label: {
+                        Label(library.isAnalyzing ? "停止识别照片主题" : "识别全部照片主题", systemImage: library.isAnalyzing ? "stop.fill" : "wand.and.stars")
                     }
+                    .disabled(library.photos.isEmpty)
+                } label: {
+                    Image(systemName: "ellipsis.circle").frame(width: 38, height: 38)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("图库操作：刷新、主题识别")
+                .accessibilityLabel("图库操作")
+                if library.isAnalyzing {
+                    Button { library.cancelAnalysis() } label: {
+                        Image(systemName: "stop.circle").frame(width: 38, height: 38)
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                    .help("停止识别 · 已完成 \(Int(library.analysisProgress * 100))%")
+                    .accessibilityLabel("停止识别照片主题")
+                }
+            } else {
+                Button { library.requestAccess() } label: {
+                    Image(systemName: "photo.on.rectangle.angled").frame(width: 38, height: 38)
                 }
                 .buttonStyle(GlassButtonStyle())
-                .disabled(library.photos.isEmpty)
-                .help(library.isAnalyzing ? "停止识别 · 已完成 \(Int(library.analysisProgress * 100))%" : "识别全部照片主题")
-                .accessibilityLabel(library.isAnalyzing ? "停止识别照片主题" : "识别全部照片主题")
+                .help("连接 iCloud 照片")
+                .accessibilityLabel("连接 iCloud 照片")
             }
 
             Button {
@@ -328,6 +357,7 @@ struct HeaderBar: View {
 
         }
         .padding(.horizontal, 24)
+        .focusedSceneValue(\.focusPhotoSearch, { searchFocused = true })
         .padding(.top, 18)
         .padding(.bottom, 12)
     }
@@ -406,9 +436,13 @@ struct BottomControlBar: View {
                 .frame(width: 64, alignment: .leading)
 
             Menu {
-                Button("全部年份") { selectedYear = nil }
+                Button { selectedYear = nil } label: {
+                    FilterMenuLabel(title: "全部年份", selected: selectedYear == nil)
+                }
                 ForEach(years, id: \.self) { year in
-                    Button(String(year)) { selectedYear = year }
+                    Button { selectedYear = year } label: {
+                        FilterMenuLabel(title: String(year), selected: selectedYear == year)
+                    }
                 }
             } label: {
                 Text(selectedYear.map(String.init) ?? "年份")
@@ -417,9 +451,13 @@ struct BottomControlBar: View {
             .fixedSize()
 
             Menu {
-                Button("全部主题") { selectedTheme = nil }
+                Button { selectedTheme = nil } label: {
+                    FilterMenuLabel(title: "全部主题", selected: selectedTheme == nil)
+                }
                 ForEach(themes) { theme in
-                    Button(theme.rawValue) { selectedTheme = theme }
+                    Button { selectedTheme = theme } label: {
+                        FilterMenuLabel(title: theme.rawValue, selected: selectedTheme == theme)
+                    }
                 }
             } label: {
                 Text(selectedTheme?.rawValue ?? "主题")
@@ -444,6 +482,8 @@ struct BottomControlBar: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("切换到\(item.rawValue)模式")
+                    .accessibilityAddTraits(mode == item ? .isSelected : [])
+                    .help("\(item.rawValue)（\(item.shortcutHint)）")
                 }
             }
             .padding(4)
@@ -453,6 +493,15 @@ struct BottomControlBar: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 14)
         .overlay(alignment: .top) { Rectangle().fill(Color.primary.opacity(0.06)).frame(height: 1) }
+    }
+}
+
+private struct FilterMenuLabel: View {
+    let title: String
+    let selected: Bool
+    var body: some View {
+        if selected { Label(title, systemImage: "checkmark") }
+        else { Text(title) }
     }
 }
 

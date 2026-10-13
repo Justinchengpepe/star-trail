@@ -54,8 +54,7 @@ struct ThemeStackGalleryView: View {
         get { browsing.activeStackID }
         nonmutating set { browsing.activeStackID = newValue }
     }
-    @State private var focusedDate = ""
-    @State private var hoveredDate: String?
+    @State private var dateState = GalleryDateState()
     @AppStorage("NebulaPhotos.StackSource") private var source = "苹果相册"
     @State private var renamingID: String?
     @State private var nameDraft = ""
@@ -84,6 +83,9 @@ struct ThemeStackGalleryView: View {
             ZStack {
             if let group = displayedGroups.first(where: { $0.id == activeGroupID }) {
                 ThemeStackBrowser(group: group, revision: revision, namespace: expansion, selectedPhoto: $selectedPhoto) {
+                    browsing.rememberStackOverview(group.id, source: source)
+                    dateState.hover(nil)
+                    dateState.focus(group.photos.first?.dateLabel ?? "")
                     withAnimation(animation) { activeGroupID = nil }
                 }
                 .id(group.id)
@@ -109,6 +111,7 @@ struct ThemeStackGalleryView: View {
             }
         }
         .onChange(of: displayedGroups.map(\.id)) { _, ids in
+            browsing.reconcileStackOverview(source: source, availableIDs: ids)
             if let activeGroupID, !ids.contains(activeGroupID) { self.activeGroupID = nil }
         }
         .alert("事件名称", isPresented: Binding(get: { renamingID != nil }, set: { if !$0 { renamingID = nil } })) {
@@ -124,34 +127,18 @@ struct ThemeStackGalleryView: View {
 
     private var overview: some View {
         GeometryReader { viewport in
+            ScrollViewReader { reader in
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(spacing: 32) {
                     ForEach(displayedGroups) { group in
                         GeometryReader { item in
                             let distance = (item.frame(in: .named("themeStacks")).midX - viewport.size.width / 2) / 240
                             let retreat = min(abs(distance), 3)
-                            VStack(spacing: 18) {
-                                ZStack {
-                                    ForEach(Array(group.photos.prefix(3).enumerated()).reversed(), id: \.element.id) { layer, photo in
-                                        PhotoCard(photo: photo, width: 168, height: 212, castsShadow: false, resolutionScale: 1.8) {
-                                            withAnimation(animation) { activeGroupID = group.id }
-                                        }
-                                        .matchedGeometryEffect(id: "\(group.id):\(photo.id)", in: expansion)
-                                        .rotationEffect(.degrees(Double(layer) * 3))
-                                        .scaleEffect(1 - CGFloat(layer) * 0.035)
-                                        .offset(x: CGFloat(layer) * 9, y: -CGFloat(layer) * 6)
-                                        .zIndex(Double(3 - layer))
-                                    }
-                                }
-                                .frame(height: 228)
-                                VStack(spacing: 4) {
-                                    Text(group.title).font(.system(size: 14, weight: .medium))
-                                    Text("\(group.photos.count) 张")
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(.secondary)
-                                }
+                            StackCoverContent(inputs: StackCoverInputs(group), namespace: expansion, source: source) {
+                                browsing.rememberStackOverview(group.id, source: source)
+                                withAnimation(animation) { activeGroupID = group.id }
                             }
-                            .frame(width: 196)
+                            .equatable()
                             .scaleEffect(reduceMotion ? 1 : 1 - retreat * 0.045)
                             .rotation3DEffect(.degrees(reduceMotion ? 0 : Double(-distance * 7)), axis: (x: 0, y: 1, z: 0))
                             .offset(y: reduceMotion ? 0 : retreat * retreat * 7)
@@ -163,21 +150,40 @@ struct ThemeStackGalleryView: View {
                             .preference(key: PhotoDateFocusKey.self, value: PhotoDateFocus(date: group.photos.first?.dateLabel ?? "", distance: abs(distance)))
                         }
                         .frame(width: 196, height: 300)
+                        .id(group.id)
                     }
                 }
                 .padding(.horizontal, max(36, (viewport.size.width - 196) / 2))
                 .frame(minHeight: viewport.size.height)
             }
             .coordinateSpace(name: "themeStacks")
+            .onAppear { restoreOverview(using: reader) }
+            .onChange(of: source) { _, _ in restoreOverview(using: reader) }
             .onPreferenceChange(PhotoDateFocusKey.self) { value in
-                if let value { focusedDate = value.date }
+                if let value { dateState.focus(value.date) }
+            }
             }
         }
         .overlay(alignment: .bottomLeading) {
-            PhotoDateCaption(date: hoveredDate ?? focusedDate).padding(24)
+            GalleryDateOverlay(state: dateState)
         }
-        .environment(\.photoFocusChanged, { hoveredDate = $0 })
+        .environment(\.photoFocusChanged, dateState.hoverHandler)
         .help("横向滚动浏览主题，点击卡组展开")
+    }
+
+    private func restoreOverview(using reader: ScrollViewProxy) {
+        guard let id = browsing.stackOverviewID(for: source),
+              displayedGroups.contains(where: { $0.id == id }) else { return }
+        let savedSource = source
+        Task { @MainActor in
+            // The new LazyHStack needs one layout turn to register its target.
+            // Restore without a second camera animation after the return spring.
+            await Task.yield()
+            guard activeGroupID == nil, source == savedSource else { return }
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { reader.scrollTo(id, anchor: .center) }
+        }
     }
 }
 
@@ -190,7 +196,7 @@ private struct ThemeStackBrowser: View {
     @Binding var selectedPhoto: MemoryPhoto?
     let close: () -> Void
     @State private var cursor: CGFloat = 0
-    @State private var hoveredDate: String?
+    @State private var hover = NebulaHoverState()
     @GestureState private var drag: CGSize = .zero
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -242,9 +248,9 @@ private struct ThemeStackBrowser: View {
                 .padding(.bottom, 18)
         }
         .overlay(alignment: .bottomLeading) {
-            PhotoDateCaption(date: hoveredDate ?? photos[currentIndex].dateLabel).padding(24)
+            NebulaDateCaption(hover: hover, currentDate: photos[currentIndex].dateLabel)
         }
-        .environment(\.photoFocusChanged, { hoveredDate = $0 })
+        .environment(\.photoFocusChanged, hover.handler)
         .onAppear { cursor = CGFloat(browsing.index(in: photos)) }
         .onChange(of: revision) { _, _ in cursor = CGFloat(browsing.index(in: photos)) }
         .onChange(of: browsing.focusedID) { _, id in

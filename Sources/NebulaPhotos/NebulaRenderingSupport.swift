@@ -2,6 +2,15 @@ import SwiftUI
 import Observation
 import Photos
 
+enum PhotoCardInputs {
+    static func matches(_ lhs: MemoryPhoto, _ rhs: MemoryPhoto) -> Bool {
+        lhs.id == rhs.id && lhs.asset.modificationDate == rhs.asset.modificationDate &&
+        lhs.createdAt == rhs.createdAt && lhs.width == rhs.width && lhs.height == rhs.height &&
+        lhs.theme == rhs.theme && lhs.themeConfidence == rhs.themeConfidence &&
+        lhs.visionLabels == rhs.visionLabels && lhs.isThemeManual == rhs.isThemeManual
+    }
+}
+
 /// Static card inputs are independent of the camera pose. The original PhotoCard
 /// still owns its press/hover animations; the caller applies the unchanged motion.
 struct NebulaCard: View, Equatable {
@@ -10,15 +19,13 @@ struct NebulaCard: View, Equatable {
     @Binding var selectedPhoto: MemoryPhoto?
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.photo.id == rhs.photo.id && lhs.photo.asset.modificationDate == rhs.photo.asset.modificationDate &&
-        lhs.photo.createdAt == rhs.photo.createdAt && lhs.photo.width == rhs.photo.width && lhs.photo.height == rhs.photo.height &&
-        lhs.photo.theme == rhs.photo.theme && lhs.photo.themeConfidence == rhs.photo.themeConfidence &&
-        lhs.photo.visionLabels == rhs.photo.visionLabels && lhs.photo.isThemeManual == rhs.photo.isThemeManual &&
+        PhotoCardInputs.matches(lhs.photo, rhs.photo) &&
         lhs.resolutionScale == rhs.resolutionScale
     }
 
     var body: some View {
-        PhotoCard(photo: photo, width: 112, height: 142, castsShadow: false, resolutionScale: resolutionScale) {
+        // No badge in the tunnel; full-size Live Photo playback is unchanged.
+        PhotoCard(photo: photo, width: 112, height: 142, castsShadow: false, resolutionScale: resolutionScale, showsLiveBadge: false) {
             selectedPhoto = photo
         }
     }

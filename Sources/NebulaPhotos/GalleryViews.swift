@@ -23,6 +23,7 @@ struct PhotoCard: View {
     var castsShadow = true
     var resolutionScale: CGFloat = 1
     var showsLiveBadge = true
+    var usesFlatLiveBadge = false
     let action: () -> Void
     @State private var isHovered = false
     @State private var hoverPoint = CGPoint(x: 0.5, y: 0.5)
@@ -53,9 +54,8 @@ struct PhotoCard: View {
         .buttonStyle(PhotoPressStyle())
         .overlay(alignment: .topLeading) {
             if showsLiveBadge && photo.isLivePhoto {
-                Image(systemName: "livephoto")
-                    .font(.system(size: 11)).padding(6)
-                    .background(.regularMaterial, in: Circle()).padding(6)
+                LivePhotoBadge(isFlat: usesFlatLiveBadge)
+                    .padding(6)
                     .help("打开大图后长按播放实况")
                     .allowsHitTesting(false)
             }
@@ -82,6 +82,28 @@ struct PhotoCard: View {
         }
         .accessibilityLabel("照片，\(photo.dateLabel)")
         .help(photo.dateLabel)
+    }
+}
+
+/// Graphite enamel: opaque fill and a fine silver edge, without backdrop blur,
+/// shadows, or independent animation. Other modes retain their original material.
+private struct LivePhotoBadge: View {
+    let isFlat: Bool
+
+    private var icon: some View {
+        Image(systemName: "livephoto")
+            .font(.system(size: 11)).padding(6)
+    }
+
+    var body: some View {
+        if isFlat {
+            icon
+                .foregroundStyle(Color.white.opacity(0.94))
+                .background(Color(white: 0.12), in: Circle())
+                .overlay(Circle().strokeBorder(Color.white.opacity(0.28), lineWidth: 0.65))
+        } else {
+            icon.background(.regularMaterial, in: Circle())
+        }
     }
 }
 
@@ -348,13 +370,12 @@ struct OrbitView: View {
 
 struct GridGalleryView: View {
     @Environment(BrowsingState.self) private var browsing
-    @State private var hoveredDate: String?
+    @State private var dateState = GalleryDateState()
     let photos: [MemoryPhoto]
     let revision: UUID
     @Binding var selectedPhoto: MemoryPhoto?
     private var cardWidth: CGFloat { browsing.gridWidth }
     @GestureState private var liveMagnification: CGFloat = 1
-    @State private var focusedDate = ""
     @State private var restoringPosition = true
     /// id → 下标映射。原实现在滚动时对每个 preference 回调做一次
     /// `photos.first(where:)`，图库上万张时是每帧 O(n) 的线性查找。
@@ -377,9 +398,8 @@ struct GridGalleryView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: width, maximum: width * 1.22), spacing: 12)], spacing: 12) {
                     ForEach(photos) { photo in
                         GeometryReader { proxy in
-                            PhotoCard(photo: photo, width: proxy.size.width, height: proxy.size.width * 1.18, showDate: true) {
-                                selectedPhoto = photo
-                            }
+                            GridPhotoCard(photo: photo, width: proxy.size.width, selectedPhoto: $selectedPhoto)
+                            .equatable()
                             .preference(key: PhotoDateFocusKey.self, value: PhotoDateFocus(date: photo.dateLabel, distance: abs(proxy.frame(in: .named("photoGrid")).minY - 20), id: photo.id))
                         }
                         .id(photo.id)
@@ -391,7 +411,7 @@ struct GridGalleryView: View {
             .coordinateSpace(name: "photoGrid")
             .onPreferenceChange(PhotoDateFocusKey.self) { value in
                 if let value, !restoringPosition {
-                    focusedDate = value.date
+                    dateState.focus(value.date)
                     if let id = value.id, let index = indexByID[id], photos.indices.contains(index) {
                         browsing.focus(photos[index])
                     } else if let photo = photos.first(where: { $0.id == value.id }) {
@@ -400,9 +420,9 @@ struct GridGalleryView: View {
                 }
             }
             .overlay(alignment: .bottomLeading) {
-                PhotoDateCaption(date: hoveredDate ?? focusedDate).padding(24)
+                GalleryDateOverlay(state: dateState)
             }
-            .environment(\.photoFocusChanged, { hoveredDate = $0 })
+            .environment(\.photoFocusChanged, dateState.hoverHandler)
             .simultaneousGesture(
                 MagnificationGesture()
                     .updating($liveMagnification) { value, state, _ in state = value }
@@ -416,7 +436,7 @@ struct GridGalleryView: View {
                 rebuildIndex()
                 if !photos.isEmpty {
                     let photo = photos[browsing.index(in: photos)]
-                    focusedDate = photo.dateLabel
+                    dateState.focus(photo.dateLabel)
                     reader.scrollTo(photo.id, anchor: .top)
                 }
                 Task { try? await Task.sleep(nanoseconds: 150_000_000); restoringPosition = false }
@@ -426,7 +446,7 @@ struct GridGalleryView: View {
                 guard !photos.isEmpty else { return }
                 restoringPosition = true
                 let photo = photos[browsing.index(in: photos)]
-                focusedDate = photo.dateLabel
+                dateState.focus(photo.dateLabel)
                 reader.scrollTo(photo.id, anchor: .top)
                 Task { try? await Task.sleep(nanoseconds: 150_000_000); restoringPosition = false }
             }
@@ -448,7 +468,9 @@ struct GalleryNavigation: View {
                     }
                     .help("上一张")
                     .accessibilityLabel("上一张")
-                    Slider(value: $cursor, in: 0...CGFloat(count - 1))
+                    Slider(value: $cursor, in: 0...CGFloat(count - 1), onEditingChanged: { editing in
+                        if !editing { PhotoInteractionActivity.finishPointerInteraction() }
+                    })
                         .tint(.cyan)
                         .accessibilityLabel("跳转照片位置")
                     Button { step(1) } label: {

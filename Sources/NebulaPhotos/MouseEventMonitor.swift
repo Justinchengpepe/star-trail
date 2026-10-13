@@ -11,13 +11,24 @@ struct GalleryPointerGate {
     private(set) var isPressed = false
     mutating func press() { isPressed = true }
     mutating func release() { isPressed = false }
+    mutating func reconcile(leftButtonPressed: Bool) {
+        // Native control tracking can consume mouseUp before local monitors see
+        // it. The next real input must recover instead of staying locked forever.
+        if !leftButtonPressed { release() }
+    }
     var permitsPointerUpdates: Bool { !isPressed }
 }
 
 // Accessed only by the main-queue input monitor and main-actor analysis scheduler.
 enum PhotoInteractionActivity {
+    static let pointerDidEnd = Notification.Name("local.nebula.pointer-did-end")
     static var lastEvent = Date.distantPast
     private static var inputMonitor: Any?
+
+    static func finishPointerInteraction() {
+        lastEvent = Date()
+        NotificationCenter.default.post(name: pointerDidEnd, object: nil)
+    }
 
     static func install() {
         guard inputMonitor == nil else { return }
@@ -63,6 +74,7 @@ struct MouseEventMonitor: NSViewRepresentable {
         private var pendingScroll: CGFloat = 0
         private var pendingPointer: (CGPoint, CGSize)?
         private var delivery: DispatchWorkItem?
+        private var resetObservers: [NSObjectProtocol] = []
 
         init(onScroll: @escaping (CGFloat) -> Void, onMove: @escaping (CGPoint, CGSize) -> Void) {
             self.onScroll = onScroll
@@ -70,11 +82,23 @@ struct MouseEventMonitor: NSViewRepresentable {
         }
 
         func install(for view: NSView) {
+            removeMonitors()
             self.view = view
             view.window?.acceptsMouseMovedEvents = true
 
+            for name in [PhotoInteractionActivity.pointerDidEnd, NSApplication.didResignActiveNotification] {
+                resetObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    self?.resetInput()
+                })
+            }
+            resetObservers.append(NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] notification in
+                guard let self, let window = notification.object as? NSWindow, window === self.view?.window else { return }
+                self.resetInput()
+            })
+
             scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
                 guard let self, self.contains(event) else { return event }
+                self.pointerGate.reconcile(leftButtonPressed: NSEvent.pressedMouseButtons & 1 != 0)
                 guard self.pointerGate.permitsPointerUpdates else { return event }
                 PhotoInteractionActivity.lastEvent = Date()
                 self.pendingScroll += abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) ? event.scrollingDeltaX : event.scrollingDeltaY
@@ -83,6 +107,7 @@ struct MouseEventMonitor: NSViewRepresentable {
             }
             moveMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .leftMouseDown, .leftMouseUp]) { [weak self] event in
                 guard let self, let view = self.view else { return event }
+                self.pointerGate.reconcile(leftButtonPressed: NSEvent.pressedMouseButtons & 1 != 0)
                 if event.type == .leftMouseUp {
                     self.pointerGate.release()
                     return event
@@ -109,6 +134,7 @@ struct MouseEventMonitor: NSViewRepresentable {
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 self.delivery = nil
+                self.pointerGate.reconcile(leftButtonPressed: NSEvent.pressedMouseButtons & 1 != 0)
                 let delta = self.pendingScroll
                 self.pendingScroll = 0
                 if delta != 0 { self.onScroll(delta) }
@@ -126,16 +152,22 @@ struct MouseEventMonitor: NSViewRepresentable {
             return view.bounds.contains(view.convert(event.locationInWindow, from: nil))
         }
 
-        func removeMonitors() {
+        private func resetInput() {
             delivery?.cancel()
             delivery = nil
             pointerGate.release()
             pendingPointer = nil
             pendingScroll = 0
+        }
+
+        func removeMonitors() {
+            resetInput()
             if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
             if let moveMonitor { NSEvent.removeMonitor(moveMonitor) }
             scrollMonitor = nil
             moveMonitor = nil
+            for observer in resetObservers { NotificationCenter.default.removeObserver(observer) }
+            resetObservers.removeAll()
         }
 
         deinit {

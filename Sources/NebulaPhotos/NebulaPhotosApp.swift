@@ -20,6 +20,7 @@ struct NebulaPhotosApp: App {
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unifiedCompact)
         .commands {
+            PhotoBrowserCommands(library: library)
             CommandGroup(replacing: .newItem) { }
             CommandGroup(after: .appSettings) {
                 Button("删除全部分析数据…") {

@@ -18,12 +18,12 @@ final class ThumbnailDecodeTicket: @unchecked Sendable {
 }
 
 enum ThumbnailDecode {
-    static func prepare(_ image: NSImage) -> DecodedThumbnail? {
+    static func prepare(_ image: NSImage, displayColorSpace: CGColorSpace? = nil) -> DecodedThumbnail? {
         guard let source = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
               let context = CGContext(data: nil, width: source.width, height: source.height,
                                       bitsPerComponent: 8, bytesPerRow: source.width * 4,
-                                      space: source.colorSpace?.model == .rgb ? source.colorSpace! : CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+                                      space: displayColorSpace ?? (source.colorSpace?.model == .rgb ? source.colorSpace! : CGColorSpaceCreateDeviceRGB()),
+                                      bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue) else { return nil }
         context.draw(source, in: CGRect(x: 0, y: 0, width: source.width, height: source.height))
         guard let decoded = context.makeImage() else { return nil }
         return DecodedThumbnail(image: NSImage(cgImage: decoded, size: image.size), cost: source.width * source.height * 4)
@@ -97,11 +97,17 @@ final class AssetThumbnailLoader: ObservableObject {
         return image
     }
 
-    private func request(asset: PHAsset, targetSize: CGSize) -> (key: String, width: Int, height: Int) {
+    private func request(asset: PHAsset, targetSize: CGSize) -> (key: String, width: Int, height: Int, displayKey: String) {
         let scale = NSScreen.main?.backingScaleFactor ?? 2
         let width = min(1600, max(384, Int(ceil(targetSize.width * scale / 128)) * 128))
         let height = min(1600, max(384, Int(ceil(targetSize.height * scale / 128)) * 128))
-        return ("\(asset.localIdentifier):\(asset.modificationDate?.timeIntervalSince1970 ?? 0)-\(width)x\(height)", width, height)
+        // Screen profiles can differ. Do not reuse a display-converted thumbnail
+        // from a different monitor after the window changes screens.
+        let screen = NSScreen.main
+        let screenID = screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+        let profile = screen?.colorSpace?.localizedName ?? "deviceRGB"
+        let displayKey = ":\(screenID?.stringValue ?? "0"):\(profile)"
+        return ("\(asset.localIdentifier):\(asset.modificationDate?.timeIntervalSince1970 ?? 0)-\(width)x\(height)\(displayKey)", width, height, displayKey)
     }
 
     func restoreCached(asset: PHAsset, targetSize: CGSize) -> Bool {
@@ -110,7 +116,7 @@ final class AssetThumbnailLoader: ObservableObject {
         let prefix = "\(asset.localIdentifier):\(asset.modificationDate?.timeIntervalSince1970 ?? 0)-"
         // Never replace an already sharper image with a lower-resolution cache
         // entry as the same tile moves between depth bands.
-        if loadedKey?.hasPrefix(prefix) == true, image != nil,
+        if loadedKey?.hasPrefix(prefix) == true, loadedKey?.hasSuffix(request.displayKey) == true, image != nil,
            loadedPixelSize.width >= CGFloat(request.width), loadedPixelSize.height >= CGFloat(request.height) { return true }
         guard let cached = Self.cache.object(forKey: request.key as NSString) else { return false }
         decodeTicket?.cancel(); decodeTicket = nil
@@ -126,7 +132,7 @@ final class AssetThumbnailLoader: ObservableObject {
         let pixelWidth = request.width, pixelHeight = request.height, requestKey = request.key
         let assetPrefix = "\(asset.localIdentifier):\(asset.modificationDate?.timeIntervalSince1970 ?? 0)-"
         guard loadedKey != requestKey else { return }
-        if loadedKey?.hasPrefix(assetPrefix) == true,
+        if loadedKey?.hasPrefix(assetPrefix) == true, loadedKey?.hasSuffix(request.displayKey) == true,
            loadedPixelSize.width >= CGFloat(pixelWidth), loadedPixelSize.height >= CGFloat(pixelHeight) { return }
         if let requestID { Self.manager.cancelImageRequest(requestID) }
         requestID = nil
@@ -137,6 +143,7 @@ final class AssetThumbnailLoader: ObservableObject {
         loadedPixelSize = CGSize(width: pixelWidth, height: pixelHeight)
         let key = requestKey as NSString
         let assetID = asset.localIdentifier
+        let displayColorSpace = NSScreen.main?.colorSpace?.cgColorSpace ?? CGColorSpaceCreateDeviceRGB()
         if let cached = Self.cache.object(forKey: key) {
             image = cached
             return
@@ -163,7 +170,10 @@ final class AssetThumbnailLoader: ObservableObject {
             Self.decodeQueue.async {
                 autoreleasepool {
                     guard ticket.isActive else { return }
-                    let prepared = ThumbnailDecode.prepare(source.image) ?? source
+                    // Move the same display-profile color management out of
+                    // CA::Layer::prepare_contents on the UI thread. Keep source
+                    // resolution and alpha; this is not an sRGB gamut reduction.
+                    let prepared = ThumbnailDecode.prepare(source.image, displayColorSpace: displayColorSpace) ?? source
                     Task { @MainActor in
                         guard ticket.isActive, let self, self.loadedKey == requestKey else { return }
                         if !degraded {
