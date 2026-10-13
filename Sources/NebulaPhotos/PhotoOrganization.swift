@@ -55,36 +55,58 @@ enum EventBuilder {
 @MainActor
 final class PhotoOrganization: ObservableObject {
     @Published var events: [PhotoEvent] = []
+    @Published private(set) var isClearing = false
     /// 只读暴露，供后台线程构建事件卡组时读取。
     private(set) var names: [String: String]
     private var task: Task<Void, Never>?
     private var generation = UUID()
     private let store = PhotoIndexStore.shared
+    private var indexingPaused = false
 
     init() {
         names = PhotoIndexStore.shared.load([String: String].self, kind: "settings", id: "eventNames") ?? [:]
     }
 
     func load(_ photos: [MemoryPhoto]) {
+        guard !indexingPaused else { return }
         task?.cancel()
         let run = UUID(); generation = run
         let records = photos.map(PhotoMetadata.init)
         let store = store
+        let epoch = store.currentGeneration
         task = Task {
             let built = await Task.detached(priority: .utility) {
                 let rawStamp = records.map { "\($0.id):\($0.stamp)" }.joined(separator: "|")
                 let stamp = SHA256.hash(data: Data(rawStamp.utf8)).map { String(format: "%02x", $0) }.joined()
                 if let cached = store.load([PhotoEvent].self, kind: "events", id: "library", stamp: stamp, version: "events-1") { return cached }
                 let built = EventBuilder.build(records)
-                store.save(built, kind: "events", id: "library", stamp: stamp, version: "events-1")
+                store.save(built, kind: "events", id: "library", stamp: stamp, version: "events-1", expectedGeneration: epoch)
                 return built
             }.value
             guard !Task.isCancelled, generation == run else { return }
             events = built
+            let validIDs = Set(built.map(\.id))
+            let retained = names.filter { validIDs.contains($0.key) }
+            if retained != names {
+                names = retained
+                store.save(names, kind: "settings", id: "eventNames", expectedGeneration: epoch)
+                objectWillChange.send()
+            }
         }
     }
 
+    func clearAnalysisData() async throws {
+        isClearing = true; defer { isClearing = false }
+        indexingPaused = true; generation = UUID(); task?.cancel(); task = nil
+        events = []; names = [:]; objectWillChange.send()
+        let store = store
+        try await Task.detached(priority: .utility) { try store.clearAll() }.value
+    }
+
+    func resumeIndexing(_ photos: [MemoryPhoto]) { indexingPaused = false; load(photos) }
+
     func renameEvent(_ id: String, title: String) {
+        guard !indexingPaused, events.contains(where: { $0.id == id }) else { return }
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if clean.isEmpty { names.removeValue(forKey: id) } else { names[id] = clean }
         store.save(names, kind: "settings", id: "eventNames")

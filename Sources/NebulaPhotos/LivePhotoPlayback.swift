@@ -9,7 +9,6 @@ final class LivePhotoPlayback: ObservableObject {
     @Published var livePhoto: PHLivePhoto?
     @Published var failedID: String?
     private var pressingID: String?
-    private var suppressedID: String?
     private var timer: Task<Void, Never>?
     private var requestID: PHImageRequestID?
     private var generation = UUID()
@@ -30,21 +29,12 @@ final class LivePhotoPlayback: ObservableObject {
         guard photo.isLivePhoto else { return }
         if hypot(translation.width, translation.height) > 8 { stop(); return }
         guard pressingID != photo.id else { return }
-        stop(); pressingID = photo.id; suppressedID = nil
+        stop(); pressingID = photo.id
         timer = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: 350_000_000) } catch { return }
             guard let self, self.pressingID == photo.id else { return }
-            self.suppressedID = photo.id; self.start(photo)
+            self.start(photo)
         }
-    }
-
-    func consumeLongPress(_ id: String) -> Bool {
-        guard suppressedID == id else { return false }
-        suppressedID = nil; return true
-    }
-
-    func stopIfPressing(_ id: String) {
-        if pressingID == id || playingID == id { stop() }
     }
 
     private func start(_ photo: MemoryPhoto) {
@@ -68,7 +58,9 @@ final class LivePhotoPlayback: ObservableObject {
     func stop() {
         timer?.cancel(); timer = nil; generation = UUID(); pressingID = nil
         if let requestID { PHImageManager.default().cancelImageRequest(requestID) }
-        requestID = nil; playingID = nil; livePhoto = nil
+        requestID = nil
+        if playingID != nil { playingID = nil }
+        if livePhoto != nil { livePhoto = nil }
     }
 }
 

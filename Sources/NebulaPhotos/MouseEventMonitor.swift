@@ -1,6 +1,19 @@
 import AppKit
 import SwiftUI
 
+enum GalleryInputPolicy {
+    // Allow small mouse/trackpad slips without stealing the native button click.
+    static let dragDistance: CGFloat = 16
+    static func acceptsPhotoHit(opacity: CGFloat) -> Bool { opacity > 0.05 }
+}
+
+struct GalleryPointerGate {
+    private(set) var isPressed = false
+    mutating func press() { isPressed = true }
+    mutating func release() { isPressed = false }
+    var permitsPointerUpdates: Bool { !isPressed }
+}
+
 // Accessed only by the main-queue input monitor and main-actor analysis scheduler.
 enum PhotoInteractionActivity {
     static var lastEvent = Date.distantPast
@@ -46,6 +59,7 @@ struct MouseEventMonitor: NSViewRepresentable {
         weak var view: NSView?
         private var scrollMonitor: Any?
         private var moveMonitor: Any?
+        private var pointerGate = GalleryPointerGate()
         private var pendingScroll: CGFloat = 0
         private var pendingPointer: (CGPoint, CGSize)?
         private var delivery: DispatchWorkItem?
@@ -61,13 +75,28 @@ struct MouseEventMonitor: NSViewRepresentable {
 
             scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
                 guard let self, self.contains(event) else { return event }
+                guard self.pointerGate.permitsPointerUpdates else { return event }
                 PhotoInteractionActivity.lastEvent = Date()
                 self.pendingScroll += abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) ? event.scrollingDeltaX : event.scrollingDeltaY
                 self.scheduleDelivery()
                 return nil
             }
-            moveMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { [weak self] event in
-                guard let self, let view = self.view, self.contains(event) else { return event }
+            moveMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .leftMouseDown, .leftMouseUp]) { [weak self] event in
+                guard let self, let view = self.view else { return event }
+                if event.type == .leftMouseUp {
+                    self.pointerGate.release()
+                    return event
+                }
+                guard self.contains(event) else { return event }
+                if event.type == .leftMouseDown {
+                    self.pointerGate.press()
+                    self.pendingPointer = nil
+                    self.pendingScroll = 0
+                    return event
+                }
+                // Keep the photo under the pointer during a press. Real drags
+                // still reach SwiftUI; only camera parallax is held steady.
+                guard self.pointerGate.permitsPointerUpdates else { return event }
                 PhotoInteractionActivity.lastEvent = Date()
                 self.pendingPointer = (view.convert(event.locationInWindow, from: nil), view.bounds.size)
                 self.scheduleDelivery()
@@ -83,7 +112,7 @@ struct MouseEventMonitor: NSViewRepresentable {
                 let delta = self.pendingScroll
                 self.pendingScroll = 0
                 if delta != 0 { self.onScroll(delta) }
-                if let pointer = self.pendingPointer {
+                if let pointer = self.pendingPointer, self.pointerGate.permitsPointerUpdates {
                     self.pendingPointer = nil
                     self.onMove(pointer.0, pointer.1)
                 }
@@ -100,6 +129,9 @@ struct MouseEventMonitor: NSViewRepresentable {
         func removeMonitors() {
             delivery?.cancel()
             delivery = nil
+            pointerGate.release()
+            pendingPointer = nil
+            pendingScroll = 0
             if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
             if let moveMonitor { NSEvent.removeMonitor(moveMonitor) }
             scrollMonitor = nil

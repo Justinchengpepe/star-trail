@@ -48,6 +48,7 @@ struct ThemeStackGalleryView: View {
     let appleGroups: [ThemePhotoStack]
     let eventGroups: [ThemePhotoStack]
     let isLoading: Bool
+    let revision: UUID
     @Binding var selectedPhoto: MemoryPhoto?
     private var activeGroupID: String? {
         get { browsing.activeStackID }
@@ -82,7 +83,7 @@ struct ThemeStackGalleryView: View {
             }
             ZStack {
             if let group = displayedGroups.first(where: { $0.id == activeGroupID }) {
-                ThemeStackBrowser(group: group, namespace: expansion, selectedPhoto: $selectedPhoto) {
+                ThemeStackBrowser(group: group, revision: revision, namespace: expansion, selectedPhoto: $selectedPhoto) {
                     withAnimation(animation) { activeGroupID = nil }
                 }
                 .id(group.id)
@@ -184,6 +185,7 @@ private struct ThemeStackBrowser: View {
     @Environment(BrowsingState.self) private var browsing
     @EnvironmentObject private var organization: PhotoOrganization
     let group: ThemePhotoStack
+    let revision: UUID
     let namespace: Namespace.ID
     @Binding var selectedPhoto: MemoryPhoto?
     let close: () -> Void
@@ -222,7 +224,7 @@ private struct ThemeStackBrowser: View {
                 }
                 .frame(width: proxy.size.width, height: proxy.size.height)
                 .contentShape(Rectangle())
-                .gesture(DragGesture()
+                .gesture(DragGesture(minimumDistance: GalleryInputPolicy.dragDistance)
                     .updating($drag) { value, state, _ in state = value.translation }
                     .onEnded { value in
                         if abs(value.predictedEndTranslation.width) > 45 {
@@ -244,7 +246,7 @@ private struct ThemeStackBrowser: View {
         }
         .environment(\.photoFocusChanged, { hoveredDate = $0 })
         .onAppear { cursor = CGFloat(browsing.index(in: photos)) }
-        .onChange(of: photos.map(\.id)) { _, _ in cursor = CGFloat(browsing.index(in: photos)) }
+        .onChange(of: revision) { _, _ in cursor = CGFloat(browsing.index(in: photos)) }
         .onChange(of: browsing.focusedID) { _, id in
             guard !photos.isEmpty else { return }
             let current = photos[currentIndex]

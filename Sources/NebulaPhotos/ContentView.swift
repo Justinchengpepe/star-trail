@@ -47,12 +47,29 @@ struct StackGroups: @unchecked Sendable {
 /// 决定分组结果是否需要重建的输入签名。
 private struct GroupBuildKey: Equatable {
     let photosRevision: UUID
-    let albumCount: Int
-    let eventCount: Int
+    let albumsRevision: UUID
+    let eventsRevision: UUID
     let eventNames: [String: String]
     let year: Int?
     let theme: MemoryTheme?
     let query: String
+}
+
+struct PhotoCatalog: @unchecked Sendable {
+    let photos: [MemoryPhoto]
+    let years: [Int]
+    let themes: [MemoryTheme]
+
+    static func build(_ photos: [MemoryPhoto], year: Int?, theme: MemoryTheme?, query: String) -> PhotoCatalog {
+        let years = Array(Set(photos.map(\.year).filter { $0 > 1900 })).sorted(by: >)
+        let present = Set(photos.compactMap(\.theme))
+        let themes = MemoryTheme.allCases.filter { present.contains($0) }
+        let filtered = year == nil && theme == nil && query.isEmpty ? photos : photos.filter { photo in
+            guard year == nil || photo.year == year, theme == nil || photo.theme == theme else { return false }
+            return query.isEmpty || ([photo.dateLabel, photo.theme?.rawValue ?? ""] + photo.visionLabels).contains { $0.localizedCaseInsensitiveContains(query) }
+        }
+        return PhotoCatalog(photos: filtered, years: years, themes: themes)
+    }
 }
 
 struct ContentView: View {
@@ -63,6 +80,10 @@ struct ContentView: View {
     @State private var mode: GalleryMode = .nebula
     @State private var query = ""
     @State private var photoListRevision = UUID()
+    @State private var albumsRevision = UUID()
+    @State private var eventsRevision = UUID()
+    @State private var displayedRevision = UUID()
+    @State private var catalog = PhotoCatalog(photos: [], years: [], themes: [])
     @State private var selectedYear: Int?
     @State private var selectedTheme: MemoryTheme?
     @State private var selectedPhoto: MemoryPhoto?
@@ -70,12 +91,14 @@ struct ContentView: View {
     @AppStorage("NebulaPhotos.DepthOfField") private var depthOfField = false
     @State private var stackGroups: StackGroups = .empty
     @State private var stackGroupsReady = false
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var cleanupResult: String?
 
     private var groupBuildKey: GroupBuildKey {
         GroupBuildKey(
             photosRevision: photoListRevision,
-            albumCount: library.albums.count,
-            eventCount: organization.events.count,
+            albumsRevision: albumsRevision,
+            eventsRevision: eventsRevision,
             eventNames: organization.names,
             year: selectedYear,
             theme: selectedTheme,
@@ -84,24 +107,15 @@ struct ContentView: View {
     }
 
     private var filteredPhotos: [MemoryPhoto] {
-        if selectedYear == nil && selectedTheme == nil && query.isEmpty { return library.photos }
-        let candidates = library.photos.filter { photo in
-            let matchesYear = selectedYear == nil || photo.year == selectedYear
-            let matchesTheme = selectedTheme == nil || photo.theme == selectedTheme
-            let matchesQuery = query.isEmpty || ([photo.dateLabel, photo.theme?.rawValue ?? ""] + photo.visionLabels)
-                .contains { $0.localizedCaseInsensitiveContains(query) }
-            return matchesYear && matchesTheme && matchesQuery
-        }
-        return candidates
+        catalog.photos
     }
 
     private var years: [Int] {
-        Array(Set(library.photos.map(\.year).filter { $0 > 1900 })).sorted(by: >)
+        catalog.years
     }
 
     private var themes: [MemoryTheme] {
-        let present = Set(library.photos.compactMap(\.theme))
-        return MemoryTheme.allCases.filter { present.contains($0) }
+        catalog.themes
     }
 
     private var displayedPhotos: [MemoryPhoto] { filteredPhotos }
@@ -139,26 +153,57 @@ struct ContentView: View {
             PhotoDetailView(photo: photo, lightBackground: lightBackground)
                 .environmentObject(library)
         }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { library.revalidateAccess() }
+        }
+        .onAppear {
+            if library.authorizationStatus == .denied || library.authorizationStatus == .restricted {
+                library.clearAnalysisData()
+            }
+        }
+        .onChange(of: library.privacyRevision) { _, _ in
+            selectedPhoto = nil; playback.stop()
+            query = ""; catalog = PhotoCatalog(photos: [], years: [], themes: [])
+            stackGroups = .empty; stackGroupsReady = false
+            Task {
+                do {
+                    try await organization.clearAnalysisData()
+                    if library.canReadLibrary {
+                        cleanupResult = "已清除本机分析数据，苹果相册原图未修改。可重新识别主题或通过星迹菜单重建事件索引。"
+                    }
+                } catch { cleanupResult = "分析索引未完全清除，请重试。" }
+            }
+        }
+        .alert("分析数据清理", isPresented: Binding(get: { cleanupResult != nil }, set: { if !$0 { cleanupResult = nil } })) {
+            Button("好") { cleanupResult = nil }
+        } message: { Text(cleanupResult ?? "") }
         .task(id: library.metadataRevision) {
             organization.load(library.photos); browsing.reconcile(library.photos)
         }
         .task(id: groupBuildKey) {
             let key = groupBuildKey
-            let photos = displayedPhotos
+            let photos = library.photos
             let albums = library.albums
             let snapshot = organization.eventStacksSnapshot()
             let built = await Task.detached(priority: .userInitiated) {
-                StackGroups.build(photos: photos, albums: albums, events: snapshot.events, names: snapshot.names)
+                let catalog = PhotoCatalog.build(photos, year: key.year, theme: key.theme, query: key.query)
+                let groups = StackGroups.build(photos: catalog.photos, albums: albums, events: snapshot.events, names: snapshot.names)
+                return (catalog, groups)
             }.value
             guard !Task.isCancelled, groupBuildKey == key else { return }
-            stackGroups = built
+            catalog = built.0
+            stackGroups = built.1
+            displayedRevision = UUID()
+            browsing.reconcile(built.0.photos)
             stackGroupsReady = true
         }
         .onChange(of: mode) { _, _ in playback.stop() }
         .onReceive(library.$photos) { _ in photoListRevision = UUID() }
-        .onChange(of: query) { _, _ in photoListRevision = UUID(); browsing.reconcile(displayedPhotos); playback.stop() }
-        .onChange(of: selectedYear) { _, _ in photoListRevision = UUID(); browsing.reconcile(displayedPhotos); playback.stop() }
-        .onChange(of: selectedTheme) { _, _ in photoListRevision = UUID(); browsing.reconcile(displayedPhotos); playback.stop() }
+        .onReceive(library.$albums) { _ in albumsRevision = UUID() }
+        .onReceive(organization.$events) { _ in eventsRevision = UUID() }
+        .onChange(of: query) { _, _ in playback.stop() }
+        .onChange(of: selectedYear) { _, _ in playback.stop() }
+        .onChange(of: selectedTheme) { _, _ in playback.stop() }
         .onAppear {
             if library.canReadLibrary && library.photos.isEmpty {
                 library.refresh()
@@ -173,19 +218,20 @@ struct ContentView: View {
         Group {
             switch mode {
             case .nebula:
-                NebulaView(photos: displayedPhotos, revision: photoListRevision, selectedPhoto: $selectedPhoto)
+                NebulaView(photos: displayedPhotos, revision: displayedRevision, selectedPhoto: $selectedPhoto)
             case .orbit:
-                OrbitView(photos: displayedPhotos, revision: photoListRevision, selectedPhoto: $selectedPhoto)
+                OrbitView(photos: displayedPhotos, revision: displayedRevision, selectedPhoto: $selectedPhoto)
             case .stack:
                 ThemeStackGalleryView(
                     groups: stackGroups.byTheme,
                     appleGroups: stackGroups.byAlbum,
                     eventGroups: stackGroups.byEvent,
                     isLoading: !stackGroupsReady,
+                    revision: displayedRevision,
                     selectedPhoto: $selectedPhoto
                 )
             case .gallery:
-                GridGalleryView(photos: displayedPhotos, revision: photoListRevision, selectedPhoto: $selectedPhoto)
+                GridGalleryView(photos: displayedPhotos, revision: displayedRevision, selectedPhoto: $selectedPhoto)
             }
         }
     }
@@ -445,6 +491,7 @@ struct CosmicBackground: View {
 struct GlassButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
+            .contentShape(Rectangle())
             .background(Color.primary.opacity(configuration.isPressed ? 0.12 : 0.06), in: RoundedRectangle(cornerRadius: 11))
             .overlay(RoundedRectangle(cornerRadius: 11).stroke(Color.primary.opacity(0.09)))
             .scaleEffect(configuration.isPressed ? 0.96 : 1)

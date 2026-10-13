@@ -1,4 +1,5 @@
 import AppKit
+import Photos
 import SwiftUI
 
 private struct DepthOfFieldKey: EnvironmentKey {
@@ -14,7 +15,6 @@ extension EnvironmentValues {
 
 struct PhotoCard: View {
     @Environment(BrowsingState.self) private var browsing
-    @EnvironmentObject private var playback: LivePhotoPlayback
     @Environment(\.photoFocusChanged) private var focusChanged
     let photo: MemoryPhoto
     var width: CGFloat = 112
@@ -22,23 +22,20 @@ struct PhotoCard: View {
     var showDate = false
     var castsShadow = true
     var resolutionScale: CGFloat = 1
+    var showsLiveBadge = true
     let action: () -> Void
     @State private var isHovered = false
     @State private var hoverPoint = CGPoint(x: 0.5, y: 0.5)
 
     var body: some View {
         Button {
-            guard !playback.consumeLongPress(photo.id) else { return }
             browsing.focus(photo)
             action()
         } label: {
             ZStack(alignment: .bottomLeading) {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(Color.primary.opacity(0.045))
-                AssetThumbnailView(asset: photo.asset, size: CGSize(width: width, height: height), resolutionScale: resolutionScale)
-                if playback.playingID == photo.id, let livePhoto = playback.livePhoto {
-                    NativeLivePhotoView(photo: livePhoto).allowsHitTesting(false)
-                }
+                AssetThumbnailView(asset: photo.asset, size: CGSize(width: width, height: height), resolutionScale: resolutionScale).equatable()
                 if showDate {
                     LinearGradient(colors: [.clear, .black.opacity(0.78)], startPoint: .center, endPoint: .bottom)
                     Text(photo.dateLabel)
@@ -48,24 +45,21 @@ struct PhotoCard: View {
                 }
             }
             .frame(width: width, height: height)
+            .contentShape(Rectangle())
             .clipShape(RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.18), lineWidth: 0.7))
             .shadow(color: castsShadow ? .black.opacity(0.32) : .clear, radius: castsShadow ? 12 : 0, y: castsShadow ? 7 : 0)
         }
         .buttonStyle(PhotoPressStyle())
-        .simultaneousGesture(DragGesture(minimumDistance: 0)
-            .onChanged { value in playback.press(photo, translation: value.translation) }
-            .onEnded { _ in playback.stop() })
         .overlay(alignment: .topLeading) {
-            if photo.isLivePhoto {
-                Image(systemName: playback.failedID == photo.id ? "exclamationmark.circle" : "livephoto")
+            if showsLiveBadge && photo.isLivePhoto {
+                Image(systemName: "livephoto")
                     .font(.system(size: 11)).padding(6)
                     .background(.regularMaterial, in: Circle()).padding(6)
-                    .help(playback.failedID == photo.id ? "读取失败，长按重试" : "长按播放实况，松开停止")
+                    .help("打开大图后长按播放实况")
                     .allowsHitTesting(false)
             }
         }
-        .onDisappear { playback.stopIfPressing(photo.id) }
         .scaleEffect(isHovered ? 1.045 : 1)
         .offset(y: isHovered ? -3 : 0)
         .rotation3DEffect(.degrees(isHovered ? Double((0.5 - hoverPoint.y) * 7) : 0), axis: (x: 1, y: 0, z: 0))
@@ -81,7 +75,6 @@ struct PhotoCard: View {
                     y: max(0, min(1, location.y / max(height, 1)))
                 )
             case .ended:
-                playback.stopIfPressing(photo.id)
                 focusChanged?(nil)
                 isHovered = false
                 hoverPoint = CGPoint(x: 0.5, y: 0.5)
@@ -103,7 +96,8 @@ struct PhotoPressStyle: ButtonStyle {
 
 struct NebulaView: View {
     @Environment(BrowsingState.self) private var browsing
-    @State private var hoveredDate: String?
+    @State private var hover = NebulaHoverState()
+    @State private var preheater = NebulaImagePreheater()
     @Environment(\.depthOfFieldEnabled) private var depthOfField
     let photos: [MemoryPhoto]
     let revision: UUID
@@ -148,17 +142,17 @@ struct NebulaView: View {
                         let blur = depthOfField ? max(0, 0.38 - depth) * 3 + max(0, depth - 1.08) * 8 : 0
                         let arrival = layered ? min(1, max(0, (arrivalSpan - item.travel) / 5)) : 1
                         let departure = layered ? min(1, max(0, (item.travel + 3) / 2.5)) : 1
-                        PhotoCard(
+                        NebulaCard(
                             photo: item.photo,
-                            width: 112,
-                            height: 142,
-                            castsShadow: false,
                             resolutionScale: depth >= 0.85 ? 2.6 : depth >= 0.5 ? 1.6 : 0.85,
-                            action: { selectedPhoto = item.photo }
+                            selectedPhoto: $selectedPhoto
                         )
+                        .equatable()
                         .scaleEffect(scale)
                         .blur(radius: blur)
                         .opacity(arrival * departure * min(1, 0.35 + depth * 0.8))
+                        .allowsHitTesting(GalleryInputPolicy.acceptsPhotoHit(opacity: arrival * departure * min(1, 0.35 + depth * 0.8)))
+                        .rotation3DEffect(.degrees(Double(drag.width / 28)), axis: (x: 0, y: 1, z: 0))
                         .offset(
                             x: point.x + drag.width * (0.035 + depth * 0.12) + (pointer.x - 0.5) * -62 * depth,
                             y: point.y + drag.height * (0.035 + depth * 0.12) + (pointer.y - 0.5) * -42 * depth
@@ -169,12 +163,9 @@ struct NebulaView: View {
                     if photos.isEmpty { NoMatchesView() }
                 }
                 .frame(width: proxy.size.width, height: proxy.size.height)
-                // 所有卡片的旋转角度相同，提到容器上只做一次 3D 变换，
-                // 避免 36 个图层各自离屏渲染。
-                .rotation3DEffect(.degrees(Double(drag.width / 28)), axis: (x: 0, y: 1, z: 0))
                 .contentShape(Rectangle())
                 .gesture(
-                    DragGesture()
+                    DragGesture(minimumDistance: GalleryInputPolicy.dragDistance)
                         .updating($drag) { value, state, _ in state = value.translation }
                         .onEnded { value in
                             moveCursor(by: -value.predictedEndTranslation.height * 0.018)
@@ -208,15 +199,22 @@ struct NebulaView: View {
                 .padding(.bottom, 22)
         }
         .overlay(alignment: .bottomLeading) {
-            PhotoDateCaption(date: hoveredDate ?? currentPhoto?.dateLabel ?? "").padding(24)
+            NebulaDateCaption(hover: hover, currentDate: currentPhoto?.dateLabel ?? "")
         }
-        .environment(\.photoFocusChanged, { newValue in
-            // 悬停时每张卡片都会回调，去重后只有日期真正变化才触发 body 重算。
-            if hoveredDate != newValue { hoveredDate = newValue }
-        })
-        .onAppear { timeCursor = CGFloat(browsing.index(in: photos)); if let currentPhoto { browsing.focus(currentPhoto) } }
+        .environment(\.photoFocusChanged, hover.handler)
+        .onAppear {
+            timeCursor = CGFloat(browsing.index(in: photos))
+            if let currentPhoto { browsing.focus(currentPhoto) }
+            preheater.update(photos, center: Int(timeCursor), force: true)
+        }
+        .onDisappear { preheater.stop() }
         .onChange(of: timeCursor) { _, _ in if let currentPhoto { browsing.focus(currentPhoto) } }
-        .onChange(of: revision) { _, _ in timeCursor = CGFloat(browsing.index(in: photos)) }
+        .onChange(of: Int(timeCursor)) { _, center in preheater.update(photos, center: center) }
+        .onChange(of: revision) { _, _ in
+            preheater.stop()
+            timeCursor = CGFloat(browsing.index(in: photos))
+            preheater.update(photos, center: Int(timeCursor), force: true)
+        }
         .onChange(of: browsing.focusedID) { _, id in
             guard currentPhoto?.id != id else { return }
             timeCursor = CGFloat(browsing.index(in: photos))
@@ -225,9 +223,9 @@ struct NebulaView: View {
 
     private func moveCursor(by amount: CGFloat) {
         guard photos.count > 1 else { return }
-        // 滚动不再包 withAnimation：连续滚动时每个事件都会新建一个 0.12s 动画事务，
-        // 事务互相打断，36 张卡片每帧都要做属性插值。滚动本身是连续输入，直接赋值更跟手。
-        timeCursor = max(0, min(CGFloat(photos.count - 1), timeCursor + amount))
+        withAnimation(.interactiveSpring(response: 0.34, dampingFraction: 0.88, blendDuration: 0.12)) {
+            timeCursor = max(0, min(CGFloat(photos.count - 1), timeCursor + amount))
+        }
     }
 
     private func tunnelPoint(photoIndex: Int, depth: CGFloat, size: CGSize) -> CGPoint {
@@ -273,7 +271,7 @@ struct OrbitView: View {
                 .frame(width: proxy.size.width, height: proxy.size.height)
                 .contentShape(Rectangle())
                 .gesture(
-                    DragGesture()
+                    DragGesture(minimumDistance: GalleryInputPolicy.dragDistance)
                         .updating($orbitDrag) { value, state, _ in state = value.translation }
                         .onEnded { value in moveOrbit(by: -value.predictedEndTranslation.width / 52) }
                 )
@@ -316,7 +314,7 @@ struct OrbitView: View {
 
     private func moveOrbit(by amount: CGFloat) {
         guard photos.count > 1 else { return }
-        withAnimation(.easeOut(duration: 0.12)) {
+        withAnimation(.interactiveSpring(response: 0.36, dampingFraction: 0.86, blendDuration: 0.12)) {
             orbitCursor += amount
             while orbitCursor < 0 { orbitCursor += CGFloat(photos.count) }
             while orbitCursor >= CGFloat(photos.count) { orbitCursor -= CGFloat(photos.count) }
@@ -446,7 +444,7 @@ struct GalleryNavigation: View {
             VStack(spacing: 8) {
                 HStack(spacing: 10) {
                     Button { step(-1) } label: {
-                        Image(systemName: "chevron.left").frame(width: 28, height: 28)
+                        Image(systemName: "chevron.left").frame(width: 28, height: 28).contentShape(Rectangle())
                     }
                     .help("上一张")
                     .accessibilityLabel("上一张")
@@ -454,7 +452,7 @@ struct GalleryNavigation: View {
                         .tint(.cyan)
                         .accessibilityLabel("跳转照片位置")
                     Button { step(1) } label: {
-                        Image(systemName: "chevron.right").frame(width: 28, height: 28)
+                        Image(systemName: "chevron.right").frame(width: 28, height: 28).contentShape(Rectangle())
                     }
                     .help("下一张")
                     .accessibilityLabel("下一张")
@@ -509,10 +507,33 @@ struct PhotoDetailView: View {
     @EnvironmentObject private var library: PhotoLibraryModel
     @EnvironmentObject private var playback: LivePhotoPlayback
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let photo: MemoryPhoto
     let lightBackground: Bool
+    let allowsLivePlayback: Bool
     @State private var image: NSImage?
+    @State private var highResolutionImage: NSImage?
+    @State private var requestID: PHImageRequestID?
+    @State private var isVisible = false
+    @State private var imageFailed = false
     @State private var chosenTheme: MemoryTheme?
+
+    @MainActor init(photo: MemoryPhoto, lightBackground: Bool, allowsLivePlayback: Bool = true) {
+        self.photo = photo; self.lightBackground = lightBackground
+        self.allowsLivePlayback = allowsLivePlayback
+        _image = State(initialValue: AssetThumbnailLoader.cachedPreview(for: photo.asset))
+    }
+
+    private func loadHighResolution() {
+        imageFailed = false
+        if let requestID { library.cancelFullImageRequest(requestID) }
+        requestID = library.requestFullImage(for: photo) { loaded in
+            guard isVisible else { return }
+            if let loaded {
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { highResolutionImage = loaded }
+            } else { imageFailed = true }
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -550,6 +571,13 @@ struct PhotoDetailView: View {
                         }
                     }
                     Spacer()
+                    if allowsLivePlayback && photo.isLivePhoto {
+                        Text(playback.failedID == photo.id ? "实况读取失败，长按重试" : "长按播放实况")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                    if imageFailed {
+                        Button("重试高清图") { loadHighResolution() }.buttonStyle(.plain)
+                    }
                     Button { dismiss() } label: {
                         Image(systemName: "xmark")
                             .frame(width: 36, height: 36)
@@ -558,11 +586,17 @@ struct PhotoDetailView: View {
                     .keyboardShortcut(.cancelAction)
                     .accessibilityLabel("关闭")
                 }
-                Group {
-                    if let image {
+                ZStack {
+                    if let highResolutionImage {
+                        Image(nsImage: highResolutionImage)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .transition(.opacity)
+                    } else if let image {
                         Image(nsImage: image)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
+                            .transition(.opacity)
                     } else {
                         ProgressView("正在从 iCloud 读取…")
                     }
@@ -570,23 +604,31 @@ struct PhotoDetailView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .clipShape(RoundedRectangle(cornerRadius: 14))
                 .overlay {
-                    if playback.playingID == photo.id, let livePhoto = playback.livePhoto {
+                    if allowsLivePlayback, playback.playingID == photo.id, let livePhoto = playback.livePhoto {
                         NativeLivePhotoView(photo: livePhoto).allowsHitTesting(false)
                     }
                 }
                 .simultaneousGesture(DragGesture(minimumDistance: 0)
-                    .onChanged { value in playback.press(photo, translation: value.translation) }
+                    .onChanged { value in
+                        guard allowsLivePlayback else { return }
+                        playback.press(photo, translation: value.translation)
+                    }
                     .onEnded { _ in playback.stop() })
-                .help(photo.isLivePhoto ? "长按播放实况，松开停止" : photo.dateLabel)
+                .help(allowsLivePlayback && photo.isLivePhoto ? "长按播放实况，松开停止" : photo.dateLabel)
             }
             .padding(24)
         }
         .frame(minWidth: 760, minHeight: 580)
         .preferredColorScheme(lightBackground ? .light : .dark)
-        .onDisappear { playback.stop() }
+        .onDisappear {
+            isVisible = false; playback.stop()
+            if let requestID { library.cancelFullImageRequest(requestID) }
+            requestID = nil
+        }
         .onAppear {
+            isVisible = true
             chosenTheme = photo.theme
-            library.requestFullImage(for: photo) { image = $0 }
+            loadHighResolution()
         }
     }
 }

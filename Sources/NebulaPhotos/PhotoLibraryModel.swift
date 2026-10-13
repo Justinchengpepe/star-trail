@@ -184,6 +184,7 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
     @Published var errorMessage: String?
     @Published var isAnalyzing = false
     @Published var analysisProgress: Double = 0
+    @Published var privacyRevision = UUID()
 
     private let imageManager = PHCachingImageManager()
     private var fetchResult: PHFetchResult<PHAsset>?
@@ -191,20 +192,33 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
     private var manualThemeIDs: Set<String> = []
     private var analysisRunID = UUID()
     private var pendingThemes: [String: (MemoryTheme, Float, [String])] = [:]
-    private let storedThemesKey = "NebulaPhotos.StoredThemes.v3"
-    private let manualThemesKey = "NebulaPhotos.ManualThemes.v2"
+    private let storedThemesKey = AnalysisPrivacy.themesKey
+    private let manualThemesKey = AnalysisPrivacy.manualKey
+    private var analysisRequestID: PHImageRequestID?
+    private var fullRequests: Set<PHImageRequestID> = []
+    private let defaults: UserDefaults
+    private let observesLibrary: Bool
 
-    override init() {
+    override convenience init() {
+        self.init(defaults: .standard, observesLibrary: true,
+                  authorizationStatus: PHPhotoLibrary.authorizationStatus(for: .readWrite))
+    }
+
+    /// An isolated preferences domain and disabled observer allow lifecycle
+    /// tests without reading a real Photos library or requesting permission.
+    init(defaults: UserDefaults, observesLibrary: Bool, authorizationStatus: PHAuthorizationStatus) {
+        self.defaults = defaults; self.observesLibrary = observesLibrary
         super.init()
+        self.authorizationStatus = authorizationStatus
         loadSavedThemes()
-        PHPhotoLibrary.shared().register(self)
-        if canReadLibrary {
-            refresh()
+        if observesLibrary {
+            PHPhotoLibrary.shared().register(self)
+            if canReadLibrary { refresh() }
         }
     }
 
     deinit {
-        PHPhotoLibrary.shared().unregisterChangeObserver(self)
+        if observesLibrary { PHPhotoLibrary.shared().unregisterChangeObserver(self) }
     }
 
     var canReadLibrary: Bool {
@@ -228,12 +242,15 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
             authorizationStatus = status
             if canReadLibrary {
                 refresh()
+            } else {
+                clearAnalysisData()
             }
         }
     }
 
     func refresh() {
-        guard canReadLibrary else { return }
+        authorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard canReadLibrary else { clearAnalysisData(); return }
         isLoading = true
         loadedCount = 0
         errorMessage = nil
@@ -265,6 +282,16 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
                 )
             }
         }
+        let allowedIDs = Set(items.map(\.id))
+        let removedPhotos = Set(photos.map(\.id)).subtracting(allowedIDs)
+        let previousThemeCount = themeCache.count
+        let previousManualCount = manualThemeIDs.count
+        themeCache = themeCache.filter { allowedIDs.contains($0.key) }
+        manualThemeIDs.formIntersection(allowedIDs)
+        pendingThemes = pendingThemes.filter { allowedIDs.contains($0.key) }
+        // A running analysis must not repopulate IDs removed from permission.
+        if isAnalyzing && !removedPhotos.isEmpty { cancelAnalysis() }
+        if themeCache.count != previousThemeCount || manualThemeIDs.count != previousManualCount { persistThemes() }
         photos = items
         loadAlbums(options: options)
         loadedCount = count
@@ -299,7 +326,7 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
     }
 
     func analyzeThemes() {
-        guard !isAnalyzing else { return }
+        guard canReadLibrary, !isAnalyzing else { return }
         let candidates = photos.filter { !$0.isThemeManual }
         guard !candidates.isEmpty else { return }
 
@@ -312,12 +339,15 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
     func cancelAnalysis() {
         analysisRunID = UUID()
+        if let analysisRequestID { imageManager.cancelImageRequest(analysisRequestID) }
+        analysisRequestID = nil
         publishPendingThemes()
         persistThemes()
         isAnalyzing = false
     }
 
     private func analyzeNext(_ candidates: [MemoryPhoto], index: Int, runID: UUID) {
+        guard analysisRunID == runID, canReadLibrary else { return }
         guard analysisRunID == runID, index < candidates.count else {
             if analysisRunID == runID {
                 isAnalyzing = false
@@ -342,7 +372,7 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
         options.resizeMode = .exact
         options.isNetworkAccessAllowed = true
 
-        imageManager.requestImage(
+        analysisRequestID = imageManager.requestImage(
             for: photo.asset,
             targetSize: CGSize(width: 768, height: 768),
             contentMode: .aspectFit,
@@ -360,7 +390,7 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
             DispatchQueue.global(qos: .utility).async {
                 let result = classifyMemoryImage(cgImage, isScreenshot: photo.asset.mediaSubtypes.contains(.photoScreenshot))
                 Task { @MainActor in
-                    guard self.analysisRunID == runID else { return }
+                    guard self.analysisRunID == runID, self.canReadLibrary else { return }
                     self.pendingThemes[photo.id] = (result.theme, result.confidence, result.labels)
                     self.themeCache[photo.id] = (result.theme, result.confidence, result.labels)
                     if (index + 1).isMultiple(of: 8) {
@@ -399,50 +429,85 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
 
     private func loadSavedThemes() {
-        let defaults = UserDefaults.standard
         manualThemeIDs = Set(defaults.stringArray(forKey: manualThemesKey) ?? [])
-        if let saved = defaults.dictionary(forKey: storedThemesKey) as? [String: [String: Any]] {
-            for (id, item) in saved {
-                guard let rawValue = item["theme"] as? String, let theme = MemoryTheme(rawValue: rawValue) else { continue }
-                themeCache[id] = (theme, (item["confidence"] as? NSNumber)?.floatValue ?? 0, item["labels"] as? [String] ?? [])
-            }
-        } else {
-            // Keep the old cache recoverable, but only carry forward explicit user corrections.
-            let legacy = defaults.dictionary(forKey: "NebulaPhotos.StoredThemes.v2") as? [String: String] ?? [:]
-            for id in manualThemeIDs {
-                if let raw = legacy[id], let theme = MemoryTheme(rawValue: raw) {
-                    themeCache[id] = (theme, 1, [])
-                }
-            }
+        let saved = AnalysisPrivacy.migrate(defaults)
+        for (id, item) in saved {
+            guard let rawValue = item["theme"] as? String, let theme = MemoryTheme(rawValue: rawValue) else { continue }
+            themeCache[id] = (theme, (item["confidence"] as? NSNumber)?.floatValue ?? 0, [])
         }
     }
 
     private func persistThemes() {
         let saved: [String: [String: Any]] = themeCache.mapValues {
-            ["theme": $0.0.rawValue, "confidence": NSNumber(value: $0.1), "labels": $0.2]
+            ["theme": $0.0.rawValue, "confidence": NSNumber(value: $0.1)]
         }
-        UserDefaults.standard.set(saved, forKey: storedThemesKey)
-        UserDefaults.standard.set(Array(manualThemeIDs), forKey: manualThemesKey)
+        defaults.set(saved, forKey: storedThemesKey)
+        defaults.set(Array(manualThemeIDs), forKey: manualThemesKey)
     }
 
-    func requestFullImage(for photo: MemoryPhoto, completion: @escaping (NSImage?) -> Void) {
+    @discardableResult
+    func requestFullImage(for photo: MemoryPhoto, completion: @escaping (NSImage?) -> Void) -> PHImageRequestID {
+        let revision = privacyRevision
         let options = PHImageRequestOptions()
         options.deliveryMode = .highQualityFormat
         options.resizeMode = .exact
         options.isNetworkAccessAllowed = true
-        options.progressHandler = { progress, _, _, _ in
-            Task { @MainActor in
-                self.loadedCount = max(self.loadedCount, Int(progress * Double(max(self.photos.count, 1))))
-            }
-        }
-        imageManager.requestImage(
+        let requestID = imageManager.requestImage(
             for: photo.asset,
             targetSize: CGSize(width: 2400, height: 2400),
             contentMode: .aspectFit,
             options: options
-        ) { image, _ in
-            Task { @MainActor in completion(image) }
+        ) { [weak self] image, info in
+            guard info?[PHImageResultIsDegradedKey] as? Bool != true else { return }
+            guard let image else { Task { @MainActor in
+                guard let self, self.privacyRevision == revision, self.canReadLibrary else { return }
+                completion(nil)
+            }; return }
+            let source = DecodedThumbnail(image: image, cost: 0)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let decoded = autoreleasepool { ThumbnailDecode.prepare(source.image) ?? source }
+                Task { @MainActor in
+                    guard let self, self.privacyRevision == revision, self.canReadLibrary else { return }
+                    completion(decoded.image)
+                }
+            }
         }
+        fullRequests.insert(requestID)
+        return requestID
+    }
+
+    func cancelFullImageRequest(_ id: PHImageRequestID) {
+        imageManager.cancelImageRequest(id)
+        fullRequests.remove(id)
+    }
+
+    func revalidateAccess() {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if status != authorizationStatus || status == .limited { refresh() }
+    }
+
+    /// Removes only this application's derived data; never mutates PhotoKit.
+    func clearAnalysisData() {
+        analysisRunID = UUID()
+        if let analysisRequestID { imageManager.cancelImageRequest(analysisRequestID) }
+        analysisRequestID = nil
+        for id in fullRequests { imageManager.cancelImageRequest(id) }
+        fullRequests.removeAll()
+        imageManager.stopCachingImagesForAllAssets()
+        themeCache.removeAll(); manualThemeIDs.removeAll(); pendingThemes.removeAll()
+        isAnalyzing = false; analysisProgress = 0
+        AnalysisPrivacy.clear(defaults)
+        AssetThumbnailLoader.clearMemoryCache()
+        if canReadLibrary {
+            photos = photos.map { item in
+                var photo = item; photo.theme = nil; photo.themeConfidence = 0
+                photo.visionLabels = []; photo.isThemeManual = false; return photo
+            }
+        } else {
+            photos = []; albums = []; fetchResult = nil
+            loadedCount = 0; totalCount = 0; isLoading = false
+        }
+        metadataRevision = UUID(); privacyRevision = UUID()
     }
 
     nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {

@@ -32,7 +32,16 @@ lipo -create \
 
 cp "$PROJECT_DIR/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
 cp "$PROJECT_DIR/Resources/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
-xattr -cr "$APP_DIR"
-codesign --force --deep --sign - "$APP_DIR"
+# Do not remove download quarantine or unrelated extended attributes.
+# Strip only metadata that codesign cannot include in a locally built bundle.
+xattr -dr com.apple.FinderInfo "$APP_DIR" 2>/dev/null || true
+xattr -dr com.apple.ResourceFork "$APP_DIR" 2>/dev/null || true
+STARTRAIL_BUILD_IDENTITY="${STARTRAIL_SIGNING_IDENTITY:--}"
+if [[ "$STARTRAIL_BUILD_IDENTITY" == "-" ]]; then
+  codesign --force --options runtime --sign - "$APP_DIR"
+else
+  codesign --force --options runtime --timestamp --sign "$STARTRAIL_BUILD_IDENTITY" "$APP_DIR"
+fi
+codesign --verify --deep --strict "$APP_DIR"
 
 echo "$APP_DIR"

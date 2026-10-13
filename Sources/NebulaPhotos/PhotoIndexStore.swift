@@ -8,6 +8,8 @@ final class PhotoIndexStore: @unchecked Sendable {
     private var database: OpaquePointer?
     private let lock = NSRecursiveLock()
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    private var generation = UUID()
+    var currentGeneration: UUID { lock.lock(); defer { lock.unlock() }; return generation }
 
     init(directory: URL? = nil) {
         self.directory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NebulaPhotos", isDirectory: true)
@@ -34,8 +36,9 @@ final class PhotoIndexStore: @unchecked Sendable {
         return Data(bytes: bytes, count: length)
     }
 
-    func write(kind: String, id: String, stamp: String = "", version: String = "1", data: Data) {
+    func write(kind: String, id: String, stamp: String = "", version: String = "1", data: Data, expectedGeneration: UUID? = nil) {
         lock.lock(); defer { lock.unlock() }
+        if let expectedGeneration, generation != expectedGeneration { return }
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, "INSERT OR REPLACE INTO records VALUES(?,?,?,?,?)", -1, &statement, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(statement) }
@@ -49,9 +52,24 @@ final class PhotoIndexStore: @unchecked Sendable {
         _ = sqlite3_step(statement)
     }
 
-    func save<T: Encodable>(_ value: T, kind: String, id: String, stamp: String = "", version: String = "1") {
+    func save<T: Encodable>(_ value: T, kind: String, id: String, stamp: String = "", version: String = "1", expectedGeneration: UUID? = nil) {
         guard let data = try? JSONEncoder().encode(value) else { return }
-        write(kind: kind, id: id, stamp: stamp, version: version, data: data)
+        write(kind: kind, id: id, stamp: stamp, version: version, data: data, expectedGeneration: expectedGeneration)
+    }
+
+    /// Derived SQLite records only; compact freed pages and truncate the WAL.
+    /// This is logical deletion, not a promise to erase backups or disk history.
+    func clearAll() throws {
+        lock.lock(); defer { lock.unlock() }
+        generation = UUID()
+        guard let database else { throw NSError(domain: "PhotoIndexStore", code: Int(SQLITE_CANTOPEN)) }
+        for sql in ["PRAGMA secure_delete=ON", "DELETE FROM records", "VACUUM", "PRAGMA wal_checkpoint(TRUNCATE)"] {
+            let code = sqlite3_exec(database, sql, nil, nil, nil)
+            guard code == SQLITE_OK else { throw NSError(domain: "PhotoIndexStore", code: Int(code)) }
+        }
+        var log: Int32 = 0, checkpointed: Int32 = 0
+        let code = sqlite3_wal_checkpoint_v2(database, nil, SQLITE_CHECKPOINT_TRUNCATE, &log, &checkpointed)
+        guard code == SQLITE_OK else { throw NSError(domain: "PhotoIndexStore", code: Int(code)) }
     }
 
     func transaction(_ operation: () -> Void) {
